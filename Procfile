@@ -1,6 +1,2 @@
-bash
-
-# Пересоздайте Procfile правильно
-cat > Procfile << 'EOF'
+text
 worker: python bot.py
-EOF'
