@@ -1,2 +1,0 @@
-bash
-echo "3.11" > .python-version
