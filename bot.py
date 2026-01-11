@@ -1,6 +1,7 @@
 import logging
 import pytz
-from datetime import datetime, time as dt_time, timedelta
+import asyncio
+from datetime import datetime, time as dt_time
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -31,6 +32,12 @@ active_reminders = {}
 
 # Часовой пояс Воронежа (MSK)
 VORONEZH_TZ = pytz.timezone('Europe/Moscow')
+
+# Функция для запуска планировщика
+async def start_scheduler(app):
+    scheduler = AsyncIOScheduler(timezone=VORONEZH_TZ)
+    scheduler.start()
+    app.scheduler = scheduler
 
 # Главное меню
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -74,7 +81,9 @@ async def toggle_time_timer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Выключаем таймер
         user_data['time_timer_active'] = False
         if user_id in active_timers:
-            active_timers[user_id].remove()
+            job = active_timers[user_id]
+            if job:
+                job.remove()
             del active_timers[user_id]
         
         await query.edit_message_text(
@@ -88,40 +97,50 @@ async def toggle_time_timer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_data['time_timer_active'] = True
         
         # Создаем задачу на отправку времени каждую минуту
-        job = context.application.scheduler.add_job(
-            send_time_update,
-            'cron',
-            minute='*',
-            args=[user_id, context.application],
-            id=f'time_timer_{user_id}'
-        )
-        active_timers[user_id] = job
-        
-        # Отправляем первое сообщение сразу
-        current_time = datetime.now(VORONEZH_TZ).strftime("%H:%M:%S")
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=f"🕒 Таймер времени Воронежа включен! Сейчас в Воронеже: {current_time}"
-        )
-        
-        await query.edit_message_text(
-            text="Таймер времени Воронежа включен! Бот будет присылать время каждую минуту.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔕 Выключить таймер", callback_data='toggle_timer')],
-                [InlineKeyboardButton("◀️ Назад", callback_data='back_to_main')]
-            ])
-        )
+        if hasattr(context.application, 'scheduler'):
+            job = context.application.scheduler.add_job(
+                send_time_update,
+                'cron',
+                minute='*',
+                args=[user_id, context.application],
+                id=f'time_timer_{user_id}',
+                replace_existing=True
+            )
+            active_timers[user_id] = job
+            
+            # Отправляем первое сообщение сразу
+            current_time = datetime.now(VORONEZH_TZ).strftime("%H:%M:%S")
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"🕒 Таймер времени Воронежа включен! Сейчас в Воронеже: {current_time}"
+            )
+            
+            await query.edit_message_text(
+                text="Таймер времени Воронежа включен! Бот будет присылать время каждую минуту.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔕 Выключить таймер", callback_data='toggle_timer')],
+                    [InlineKeyboardButton("◀️ Назад", callback_data='back_to_main')]
+                ])
+            )
+        else:
+            await query.edit_message_text(
+                text="Ошибка: планировщик не инициализирован.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("◀️ Назад", callback_data='back_to_main')]
+                ])
+            )
     
     return MAIN_MENU
 
 # Функция отправки времени
 async def send_time_update(user_id: int, app):
     try:
-        current_time = datetime.now(VORONEZH_TZ).strftime("%H:%M:%S")
-        await app.bot.send_message(
-            chat_id=user_id,
-            text=f"🕒 Сейчас в Воронеже: {current_time}"
-        )
+        if user_id in user_data_store and user_data_store[user_id]['time_timer_active']:
+            current_time = datetime.now(VORONEZH_TZ).strftime("%H:%M:%S")
+            await app.bot.send_message(
+                chat_id=user_id,
+                text=f"🕒 Сейчас в Воронеже: {current_time}"
+            )
     except Exception as e:
         logger.error(f"Ошибка отправки времени пользователю {user_id}: {e}")
         # Если пользователь заблокировал бота, удаляем таймер
@@ -174,47 +193,55 @@ async def set_reminder_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not (0 <= hour <= 23 and 0 <= minute <= 59):
             raise ValueError
         
-        # Создаем объект времени для сегодня
+        # Создаем объект времени
         reminder_time = dt_time(hour, minute)
         
         # Создаем уникальный ID для напоминания
-        reminder_id = f"reminder_{user_id}_{len(user_data_store[user_id]['reminders'])}"
+        reminder_id = f"reminder_{user_id}_{int(datetime.now().timestamp())}"
         
         # Сохраняем напоминание
         reminder_data = {
             'id': reminder_id,
-            'text': context.user_data['reminder_text'],
+            'text': context.user_data.get('reminder_text', ''),
             'time': reminder_time,
             'active': True
         }
         
+        if user_id not in user_data_store:
+            user_data_store[user_id] = {'reminders': [], 'time_timer_active': False}
+        
         user_data_store[user_id]['reminders'].append(reminder_data)
         
         # Создаем задачу в планировщике
-        trigger = CronTrigger(hour=hour, minute=minute, timezone=VORONEZH_TZ)
-        job = context.application.scheduler.add_job(
-            send_reminder,
-            trigger,
-            args=[user_id, context.user_data['reminder_text'], reminder_id, context.application],
-            id=reminder_id
-        )
-        
-        active_reminders[reminder_id] = job
-        
-        await update.message.reply_text(
-            text=f"✅ Напоминание установлено!\n\n"
-                 f"📝 Текст: \"{context.user_data['reminder_text']}\"\n"
-                 f"🕒 Время: {time_str}\n\n"
-                 f"Бот отправит вам это сообщение в указанное время.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🚫 Отключить это сообщение", callback_data=f'disable_{reminder_id}')],
-                [InlineKeyboardButton("◀️ Назад в меню", callback_data='back_to_main')]
-            ])
-        )
-        
-        # Очищаем временные данные
-        if 'reminder_text' in context.user_data:
-            del context.user_data['reminder_text']
+        if hasattr(context.application, 'scheduler'):
+            trigger = CronTrigger(hour=hour, minute=minute, timezone=VORONEZH_TZ)
+            job = context.application.scheduler.add_job(
+                send_reminder,
+                trigger,
+                args=[user_id, context.user_data.get('reminder_text', ''), reminder_id, context.application],
+                id=reminder_id,
+                replace_existing=True
+            )
+            
+            active_reminders[reminder_id] = job
+            
+            await update.message.reply_text(
+                text=f"✅ Напоминание установлено!\n\n"
+                     f"📝 Текст: \"{context.user_data.get('reminder_text', '')}\"\n"
+                     f"🕒 Время: {time_str}\n\n"
+                     f"Бот отправит вам это сообщение в указанное время.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🚫 Отключить это сообщение", callback_data=f'disable_{reminder_id}')],
+                    [InlineKeyboardButton("◀️ Назад в меню", callback_data='back_to_main')]
+                ])
+            )
+        else:
+            await update.message.reply_text(
+                text="Ошибка: планировщик не инициализирован.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("◀️ Назад", callback_data='back_to_main')]
+                ])
+            )
             
     except (ValueError, IndexError):
         await update.message.reply_text(
@@ -224,6 +251,10 @@ async def set_reminder_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ])
         )
         return SET_REMINDER_TIME
+    
+    # Очищаем временные данные
+    if 'reminder_text' in context.user_data:
+        del context.user_data['reminder_text']
     
     return MAIN_MENU
 
@@ -287,14 +318,12 @@ async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # Основная функция
-def main():
+async def main():
     # Создаем Application
-    application = Application.builder().token("YOUR_BOT_TOKEN").build()
+    application = Application.builder().token("8517372931:AAG66lYcPsP_6bwQA4QVaMa-A_YYYWWBmQQ").build()
     
     # Инициализируем планировщик
-    scheduler = AsyncIOScheduler(timezone=VORONEZH_TZ)
-    scheduler.start()
-    application.scheduler = scheduler
+    await start_scheduler(application)
     
     # Создаем ConversationHandler
     conv_handler = ConversationHandler(
@@ -324,7 +353,18 @@ def main():
     
     # Запуск бота
     print("Бот запущен...")
-    application.run_polling(allowed_updates=Update.ALL_UPDATES)
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling()
+    
+    # Запускаем бесконечный цикл
+    try:
+        await asyncio.Event().wait()
+    except (KeyboardInterrupt, SystemExit):
+        await application.stop()
+        if hasattr(application, 'scheduler'):
+            application.scheduler.shutdown()
 
 if __name__ == '__main__':
-    main()
+    # Запускаем асинхронную функцию
+    asyncio.run(main())
