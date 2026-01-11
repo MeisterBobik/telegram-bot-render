@@ -63,7 +63,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Функция отправки времени каждую минуту
 async def send_time_periodically(user_id: int, app):
-    while user_id in user_data_store and user_data_store[user_id]['time_timer_active']:
+    while user_id in user_data_store and user_data_store[user_id].get('time_timer_active', False):
         try:
             current_time = datetime.now(VORONEZH_TZ).strftime("%H:%M:%S")
             await app.bot.send_message(
@@ -81,6 +81,10 @@ async def toggle_time_timer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     
     user_id = query.from_user.id
+    
+    if user_id not in user_data_store:
+        user_data_store[user_id] = {'time_timer_active': False, 'reminders': []}
+    
     user_data = user_data_store[user_id]
     
     if user_data['time_timer_active']:
@@ -154,6 +158,9 @@ async def set_reminder_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     try:
         hour, minute = map(int, time_str.split(':'))
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError
+        
         reminder_id = f"reminder_{user_id}_{int(datetime.now().timestamp())}"
         
         # Сохраняем напоминание
@@ -180,11 +187,12 @@ async def set_reminder_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ])
         )
         
-        del context.user_data['reminder_text']
+        if 'reminder_text' in context.user_data:
+            del context.user_data['reminder_text']
         
     except:
         await update.message.reply_text(
-            text="❌ Неверный формат. Введите ЧЧ:ММ",
+            text="❌ Неверный формат. Введите ЧЧ:ММ (например, 14:30)",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("◀️ Назад", callback_data='back_to_main')]
             ])
@@ -223,8 +231,8 @@ async def send_reminder_at_time(user_id: int, text: str, reminder_id: str, hour:
                     if r['id'] != reminder_id
                 ]
             break
-    except:
-        pass
+    except Exception as e:
+        logger.error(f"Ошибка отправки напоминания: {e}")
 
 # Отключение напоминания
 async def disable_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -247,9 +255,11 @@ async def disable_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return MAIN_MENU
 
 # Основная функция
-async def main():
+def main():
+    # Создаем Application
     application = Application.builder().token("8517372931:AAG66lYcPsP_6bwQA4QVaMa-A_YYYWWBmQQ").build()
     
+    # Создаем ConversationHandler
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start)],
         states={
@@ -274,14 +284,7 @@ async def main():
     application.add_handler(conv_handler)
     
     print("Бот запущен...")
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling()
-    
-    try:
-        await asyncio.Event().wait()
-    except (KeyboardInterrupt, SystemExit):
-        await application.stop()
+    application.run_polling()
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    main()
